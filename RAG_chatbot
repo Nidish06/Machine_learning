@@ -1,0 +1,134 @@
+import os
+import tempfile
+from typing import List
+
+import streamlit as st
+import pdfplumber
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.docstore.document import Document
+from langchain_groq import ChatGroq   # ✅ Groq LLM wrapper
+from langchain_community.embeddings import HuggingFaceEmbeddings  # ✅ use HuggingFace for embeddings
+from langchain_community.vectorstores import FAISS
+from langchain.chains import ConversationalRetrievalChain
+
+# ---------------------- Helpers ---------------------
+
+def extract_text_from_pdf(file_path: str) -> List[Document]:
+    """Extract text from each page of a PDF and return list of LangChain Documents with metadata."""
+    docs = []
+    with pdfplumber.open(file_path) as pdf:
+        for i, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+            if text.strip():
+                metadata = {
+                    "source": os.path.basename(file_path),
+                    "page": i + 1,
+                }
+                docs.append(Document(page_content=text, metadata=metadata))
+    return docs
+
+
+def load_and_split_documents(uploaded_files) -> List[Document]:
+    """Take uploaded files, extract text and split into chunks."""
+    all_docs = []
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=150,
+        separators=["\n\n", "\n", " ", ""]
+    )
+
+    for uploaded_file in uploaded_files:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tf:
+            tf.write(uploaded_file.getbuffer())
+            temp_path = tf.name
+
+        docs = extract_text_from_pdf(temp_path)
+        if docs:
+            split_docs = []
+            for d in docs:
+                pieces = splitter.split_text(d.page_content)
+                for i, p in enumerate(pieces):
+                    meta = dict(d.metadata)
+                    meta.update({"chunk": i + 1})
+                    split_docs.append(Document(page_content=p, metadata=meta))
+            all_docs.extend(split_docs)
+    return all_docs
+
+
+# ---------------------- Streamlit UI ----------------------
+
+st.set_page_config(page_title="Resume RAG Chatbot", layout="wide")
+st.title("📄 Resume RAG Chatbot — LangChain + Streamlit")
+
+# Sidebar: settings
+st.sidebar.header("Settings")
+groq_key = st.sidebar.text_input("Groq API key (or set GROQ_API_KEY env)", type="password")
+use_persistent_index = st.sidebar.checkbox("Persist vectorstore to disk (./faiss_index)", value=False)
+chosen_model = st.sidebar.selectbox(
+    "LLM Model",
+    options=["mixtral-8x7b-32768", "llama2-70b-4096"],  # ✅ Groq models
+    index=0
+)
+
+# Handle API key
+if groq_key:
+    os.environ["GROQ_API_KEY"] = groq_key
+elif not os.getenv("GROQ_API_KEY"):
+    st.warning("Set your Groq API key in the sidebar or as GROQ_API_KEY environment variable.")
+
+# File uploader
+st.subheader("1) Upload resume PDFs (you can upload multiple)")
+uploaded_files = st.file_uploader("Upload PDF resumes", type=["pdf"], accept_multiple_files=True)
+
+# Buttons
+process_button = st.button("Process uploaded files and build index")
+
+# Session state: store vectorstore and chain
+if "vectorstore" not in st.session_state:
+    st.session_state["vectorstore"] = None
+if "qa_chain" not in st.session_state:
+    st.session_state["qa_chain"] = None
+if "docs_count" not in st.session_state:
+    st.session_state["docs_count"] = 0
+
+# Process files
+if process_button and uploaded_files:
+    with st.spinner("Extracting text and building vectorstore — this may take a while for many PDFs..."):
+        docs = load_and_split_documents(uploaded_files)
+        st.session_state["docs_count"] = len(docs)
+
+        if not docs:
+            st.error("No readable text found in uploaded PDFs. Try different files or check PDF text extraction.")
+        else:
+            # ✅ Use HuggingFace for embeddings (Groq doesn’t provide embeddings)
+            embeddings = HuggingFaceEmbeddings()
+
+            if use_persistent_index:
+                index_path = "faiss_index"
+                if os.path.exists(index_path):
+                    vectorstore = FAISS.load_local(index_path, embeddings)
+                else:
+                    vectorstore = FAISS.from_documents(docs, embeddings)
+                    vectorstore.save_local(index_path)
+            else:
+                vectorstore = FAISS.from_documents(docs, embeddings)
+
+            st.session_state["vectorstore"] = vectorstore
+
+            # ✅ Build conversational retrieval chain with Groq LLM
+            llm = ChatGroq(
+                model_name=chosen_model,
+                temperature=0,
+                groq_api_key=os.getenv("GROQ_API_KEY")
+            )
+            retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+
+            qa_chain = ConversationalRetrievalChain.from_llm(
+                llm=llm,
+                retriever=retriever,
+                return_source_documents=True,
+            )
+            st.session_state["qa_chain"] = qa_chain
+
+            st.success(f"Index built with {len(docs)} chunks from {len(uploaded_files)} files.")
